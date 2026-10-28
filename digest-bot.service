@@ -1,0 +1,33 @@
+# systemd unit for AI Digest Bot.
+# Runs as the shared unprivileged service user "bots", project in /home/bots/ai-digest.
+#   sudo cp digest-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now digest-bot
+
+[Unit]
+Description=AI Digest Telegram Bot (bot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bots
+Group=bots
+WorkingDirectory=/home/bots/ai-digest
+# Python from the project venv: python-dotenv is installed there and reads .env
+ExecStart=/home/bots/ai-digest/.venv/bin/python bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+
+# Hardening: the bot only needs outbound HTTPS and write access to its own folder
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/bots/ai-digest
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

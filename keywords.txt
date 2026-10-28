@@ -1,0 +1,15 @@
+# Prefilter for arXiv papers: a paper reaches the LLM only if its title or abstract
+# contains at least one of these phrases (case-insensitive, substring match),
+# or it is in HF Daily Papers.
+# Title matches weigh 3x; HF Daily Papers upvotes add a bonus.
+# Comma or newline separated; '#' starts a comment.
+# post-training / RL
+RLHF, RLAIF, DPO, GRPO, PPO, reward model, reward hacking, preference optimization,
+post-training, reinforcement learning, RLVR, verifiable reward, policy optimization
+# architectures / training
+mixture of experts, MoE, state space model, Mamba, linear attention, long context,
+transformer architecture, scaling law, pretraining, distillation, test-time compute, reasoning model
+# safety / security
+alignment, AI safety, jailbreak, prompt injection, red teaming, red-teaming, backdoor,
+data poisoning, sandbox, agent security, guardrail, interpretability, deception, sycophancy,
+unlearning, adversarial attack, tool use, LLM agent, agentic

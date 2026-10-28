@@ -1,0 +1,12 @@
+# Copy this file to system_prompt.txt and fill in your own profile.
+# system_prompt.txt is gitignored and will never be committed.
+
+Reader profile:
+- AI and Security Researcher
+
+Priority topics:
+1. New LLM/transformer architectures and training innovations
+2. NLP breakthroughs — reasoning, long context, multimodal
+3. Reinforcement learning for LLMs (RLHF, GRPO, PPO, reward modeling)
+4. AI safety: agent security, prompt injection, jailbreaks, sandboxing
+5. Surprising industry moves or benchmark-breaking results

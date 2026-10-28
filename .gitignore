@@ -1,0 +1,13 @@
+.env
+.venv/
+state.json
+state.tmp
+seen_ids.json
+last_digest.json
+system_prompt.txt
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.vscode/
+.idea/
