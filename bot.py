@@ -20,7 +20,7 @@ Commands:
 Personalisation: system_prompt.txt (profile), keywords.txt (paper prefilter).
 """
 
-import os, sys, json, re, time, html, urllib.request
+import os, sys, json, re, time, html, hashlib, urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,7 +73,8 @@ SECTIONS = {
 }
 ALIASES = {"tg": "tg", "telegram": "tg", "каналы": "tg",
            "papers": "papers", "arxiv": "papers", "статьи": "papers",
-           "blogs": "blogs", "блоги": "blogs", "search": "search", "поиск": "search"}
+           "blogs": "blogs", "блоги": "blogs", "search": "search", "поиск": "search",
+           "pool": "pool", "подборка": "pool"}
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 MAX_DAYS = 60
 
@@ -86,6 +87,8 @@ def load_state() -> dict:
     s = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     for key in ("last_run", "seen", "digests", "scheduled"):
         s.setdefault(key, {})
+    for key in ("pool", "published"):           # pool: items picked for the next post
+        s.setdefault(key, [])
     return s
 
 
@@ -120,7 +123,7 @@ def pack_messages(header: str, blocks: list[str], limit: int = 3800) -> list[str
     """Pack blocks into messages without ever cutting a block (and its HTML) in half."""
     messages, cur = [], header
     for b in blocks:
-        piece = "\n\n\n" + b
+        piece = ("\n\n\n" if cur else "") + b      # header may be empty (pool without intro)
         if len(cur) + len(piece) > limit:
             messages.append(cur)
             cur = b
@@ -146,19 +149,43 @@ def tg_get_updates(offset=0) -> list:
 
 # ── Running a section ─────────────────────────────────────────────────────────
 
-def _publish_button(section: str):
-    if not TELEGRAM_CHANNEL_ID:
-        return None
-    return {"inline_keyboard": [[{"text": "📢 Опубликовать в канал",
-                                  "callback_data": f"publish:{section}"}]]}
+def item_key(block: str) -> str:
+    """An item is identified by its own link (the first href in the block)."""
+    m = re.search(r'href="([^"]+)"', block)
+    return m.group(1) if m else block[:200]
+
+
+def item_title(block: str) -> str:
+    m = re.search(r"<a [^>]*>(.*?)</a>", block)
+    return m.group(1) if m else "без названия"
+
+
+def short_hash(key: str) -> str:
+    return hashlib.md5(key.encode()).hexdigest()[:10]
+
+
+def digest_keyboard(state: dict, section: str) -> dict:
+    """Under a preview: one toggle per item (add to / remove from the pool), and the whole digest."""
+    d = state["digests"][section]
+    in_pool = {p["key"] for p in state["pool"]}
+    published = set(state["published"])
+    buttons = []
+    for i, b in enumerate(d["blocks"], 1):
+        k = item_key(b)
+        label = f"📢 {i}" if k in published else (f"✓ {i}" if k in in_pool else f"＋ {i}")
+        buttons.append({"text": label, "callback_data": f"t:{section}:{d['id']}:{i}"})
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    if TELEGRAM_CHANNEL_ID:
+        rows.append([{"text": "📢 Весь дайджест в канал", "callback_data": f"publish:{section}:{d['id']}"}])
+    return {"inline_keyboard": rows}
 
 
 def deliver(state: dict, section: str, header: str, blocks: list[str]):
-    """Preview to the owner + remember it for /publish."""
-    state["digests"][section] = {"header": header, "blocks": blocks, "published": False}
+    """Preview to the owner + remember it for the pool and /publish."""
+    state["digests"][section] = {"id": int(time.time()), "header": header, "blocks": blocks}
     state["last_section"] = section
     save_state(state)
-    tg_send_blocks(TELEGRAM_CHAT_ID, header, blocks, reply_markup=_publish_button(section))
+    tg_send_blocks(TELEGRAM_CHAT_ID, header, blocks, reply_markup=digest_keyboard(state, section))
 
 
 def run_section(section: str, days: int = None, scheduled: bool = False):
@@ -267,40 +294,113 @@ def parse_publish(text: str, entities: list) -> tuple[list[str], str]:
     return args, intro
 
 
-def cmd_publish(args: list[str], intro: str = ""):
+SECTION_ORDER = ["tg", "papers", "blogs", "search"]
+SECTION_TITLES = {**{k: v["title"] for k, v in SECTIONS.items()}, "search": "🔍 Поиск по arXiv"}
+
+
+def _renumber(block: str, i: int) -> str:
+    return re.sub(r"^<b>\d+\. ", f"<b>{i}. ", block, count=1)
+
+
+def publish_to_channel(state: dict, header: str, blocks: list[str]):
+    """Post to the channel, mark the items as published and drop them from the pool."""
+    tg_send_blocks(TELEGRAM_CHANNEL_ID, header, blocks)
+    keys = {item_key(b) for b in blocks}
+    state["published"] = (state["published"] + sorted(keys - set(state["published"])))[-3000:]
+    state["pool"] = [p for p in state["pool"] if p["key"] not in keys]
+    save_state(state)
+
+
+def _check_channel() -> bool:
     if not TELEGRAM_CHANNEL_ID:
         tg_send(TELEGRAM_CHAT_ID, "Канал не настроен: добавьте <code>TELEGRAM_CHANNEL_ID</code> в .env")
-        return
-    state = load_state()
-    section = next((ALIASES[a.lower()] for a in args if a.lower() in ALIASES), None) \
-        or state.get("last_section")
-    d = state["digests"].get(section) if section else None
-    if not d:
-        tg_send(TELEGRAM_CHAT_ID, "Нечего публиковать: сначала /tg, /papers, /blogs или /arxiv")
+    return bool(TELEGRAM_CHANNEL_ID)
+
+
+def cmd_publish(args: list[str], intro: str = ""):
+    """/publish [section] [numbers] [force] [intro] — one section; /publish pool — the pool."""
+    if not _check_channel():
         return
     if len(intro) > MAX_INTRO:
         tg_send(TELEGRAM_CHAT_ID, f"Вступление слишком длинное: {len(intro)} символов, максимум {MAX_INTRO}.")
         return
-    if d.get("published") and "force" not in args:
-        tg_send(TELEGRAM_CHAT_ID, "Этот дайджест уже опубликован. Повторно: "
-                                  f"<code>/publish {section} force</code>")
+    named = [ALIASES[a.lower()] for a in args if a.lower() in ALIASES]
+    if "pool" in named:
+        publish_pool(intro)
         return
 
-    blocks = d["blocks"]
-    nums = [int(a) for a in args if a.isdigit()]
-    if nums:
-        bad = [x for x in nums if not 1 <= x <= len(blocks)]
-        if bad:
-            tg_send(TELEGRAM_CHAT_ID, f"Нет пунктов {bad}. В дайджесте пунктов: {len(blocks)}")
-            return
-        blocks = [blocks[x - 1] for x in nums]
-    blocks = [re.sub(r"^<b>\d+\. ", f"<b>{i}. ", b, count=1) for i, b in enumerate(blocks, 1)]
+    state = load_state()
+    section = (named[0] if named else None) or state.get("last_section")
+    d = state["digests"].get(section) if section else None
+    if not d:
+        tg_send(TELEGRAM_CHAT_ID, "Нечего публиковать: сначала /tg, /papers, /blogs или /arxiv")
+        return
+    nums = [int(a) for a in args if a.isdigit()] or list(range(1, len(d["blocks"]) + 1))
+    bad = [x for x in nums if not 1 <= x <= len(d["blocks"])]
+    if bad:
+        tg_send(TELEGRAM_CHAT_ID, f"Нет пунктов {bad}. В дайджесте пунктов: {len(d['blocks'])}")
+        return
 
-    header = f"{intro}\n\n{d['header']}" if intro else d["header"]   # intro goes on top of the post
-    tg_send_blocks(TELEGRAM_CHANNEL_ID, header, blocks)
-    d["published"] = True
-    save_state(state)
-    tg_send(TELEGRAM_CHAT_ID, f"✅ Опубликовано в канал: {len(blocks)} пункт(ов)")
+    published = set(state["published"])
+    force = "force" in [a.lower() for a in args]
+    chosen = [(x, d["blocks"][x - 1]) for x in nums]
+    skipped = [x for x, b in chosen if item_key(b) in published and not force]
+    blocks = [b for x, b in chosen if x not in skipped]
+    if not blocks:
+        tg_send(TELEGRAM_CHAT_ID, f"Пункты {skipped} уже опубликованы. Повторно: "
+                                  f"<code>/publish {section} {' '.join(map(str, nums))} force</code>")
+        return
+    blocks = [_renumber(b, i) for i, b in enumerate(blocks, 1)]
+    header = f"{intro}\n\n{d['header']}" if intro else d["header"]   # intro on top of the post
+    publish_to_channel(state, header, blocks)
+    note = f" Пропущены уже опубликованные: {skipped}." if skipped else ""
+    tg_send(TELEGRAM_CHAT_ID, f"✅ Опубликовано в канал: {len(blocks)} пункт(ов).{note}")
+
+
+def publish_pool(intro: str = "") -> bool:
+    """The pool as one post: grouped by section, numbered through, intro on top."""
+    if not _check_channel():
+        return False
+    state = load_state()
+    pool = [p for p in state["pool"] if p["key"] not in set(state["published"])]
+    if not pool:
+        tg_send(TELEGRAM_CHAT_ID, "Подборка пуста. Добавляйте пункты кнопками ＋ под превью.")
+        return False
+    blocks, i = [], 0
+    for section in SECTION_ORDER:
+        items = [p for p in pool if p["section"] == section]
+        for j, p in enumerate(items):
+            i += 1
+            b = _renumber(p["block"], i)
+            blocks.append(f"<b>{SECTION_TITLES[section]}</b>\n\n{b}" if j == 0 else b)
+    publish_to_channel(state, intro, blocks)
+    tg_send(TELEGRAM_CHAT_ID, f"✅ Подборка опубликована: {len(blocks)} пункт(ов). Подборка очищена.")
+    return True
+
+
+def pool_view(state: dict) -> tuple[str, dict]:
+    pool = state["pool"]
+    if not pool:
+        return "Подборка пуста. Добавляйте пункты кнопками ＋ под превью.", {"inline_keyboard": []}
+    lines, buttons, i = [f"<b>Подборка</b> · {len(pool)} пункт(ов)"], [], 0
+    for section in SECTION_ORDER:
+        items = [p for p in pool if p["section"] == section]
+        if items:
+            lines.append(f"\n<b>{SECTION_TITLES[section]}</b>")
+        for p in items:
+            i += 1
+            lines.append(f"{i}. {item_title(p['block'])}")
+            buttons.append({"text": f"✖ {i}", "callback_data": f"pr:{short_hash(p['key'])}"})
+    rows = [buttons[k:k + 4] for k in range(0, len(buttons), 4)]
+    rows.append([{"text": "📢 Опубликовать подборку", "callback_data": "pp"},
+                 {"text": "🗑 Очистить", "callback_data": "pc"}])
+    lines.append("\n✖ — убрать пункт. Со вступлением: <code>/publish pool</code> и текст с новой строки.")
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def cmd_pool():
+    text, kb = pool_view(load_state())
+    tg_send(TELEGRAM_CHAT_ID, text, reply_markup=kb)
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -329,6 +429,7 @@ def cmd_status():
         lines.append(f"{cfg['title']}: следующий {WEEKDAYS[nxt.weekday()]} {nxt:%d.%m %H:%M}, "
                      f"прошлый {last_s}")
     lines.append(f"\nКанал: {html.escape(TELEGRAM_CHANNEL_ID) or 'не настроен'}")
+    lines.append(f"В подборке: {len(state['pool'])} пункт(ов) — /pool")
     lines.append(f"Модели: {digest.MODEL} / {digest.DEEP_MODEL}")
     tg_send(TELEGRAM_CHAT_ID, "\n".join(lines))
 
@@ -343,10 +444,13 @@ def cmd_help():
         "/blogs [дни] — блоги авторов (30)\n"
         "/digest [дни] — все три раздела\n"
         "/arxiv &lt;запрос&gt; — поиск по arXiv\n"
-        "/publish [раздел] [номера] [force] [текст] — в канал\n"
-        "    <code>/publish papers 1 3</code>\n"
-        "    <code>/publish papers 1 3 Главное за неделю: …</code>\n"
-        "    текст можно с новой строки и с форматированием\n"
+        "\n<b>Публикация</b>\n"
+        "＋ под превью — добавить пункт в подборку (✓ — уже в ней, 📢 — опубликован)\n"
+        "/pool — подборка: убрать пункты, опубликовать одним постом\n"
+        "/publish pool [текст] — подборка со вступлением\n"
+        "/publish [раздел] [номера] [текст] — сразу в канал, например\n"
+        "    <code>/publish papers 3</code>\n"
+        "текст вступления можно с новой строки и с форматированием\n\n"
         "/status — расписание и прошлые запуски\n"
         "/help — эта справка"
     ))
@@ -385,6 +489,8 @@ def handle_message(msg: dict):
     elif cmd == "/publish":
         args, intro = parse_publish(text, msg.get("entities"))
         cmd_publish(args, intro)
+    elif cmd == "/pool":
+        cmd_pool()
     elif cmd == "/status":
         cmd_status()
     elif cmd in ("/help", "/start"):
@@ -393,21 +499,77 @@ def handle_message(msg: dict):
         tg_send(TELEGRAM_CHAT_ID, "Не знаю такой команды. Список: /help")
 
 
+def _edit_markup(msg: dict, markup: dict):
+    try:
+        tg_api("editMessageReplyMarkup", chat_id=msg["chat"]["id"],
+               message_id=msg["message_id"], reply_markup=markup)
+    except Exception:
+        pass                                           # "message is not modified" etc.
+
+
+def _edit_text(msg: dict, text: str, markup: dict):
+    try:
+        tg_api("editMessageText", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+               text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup)
+    except Exception:
+        pass
+
+
 def handle_callback(cq: dict):
-    """Inline button under a digest preview."""
+    """Buttons under previews and under /pool."""
+    def answer(text: str = ""):
+        tg_api("answerCallbackQuery", callback_query_id=cq["id"], text=text)
+
     if str(cq.get("from", {}).get("id", "")) != TELEGRAM_CHAT_ID:
-        tg_api("answerCallbackQuery", callback_query_id=cq["id"])
+        answer()
         return
-    data = cq.get("data") or ""
-    tg_api("answerCallbackQuery", callback_query_id=cq["id"])
-    if data.startswith("publish:"):
-        msg = cq.get("message", {})
-        try:  # remove the button so it can't be pressed twice
-            tg_api("editMessageReplyMarkup", chat_id=msg["chat"]["id"],
-                   message_id=msg["message_id"], reply_markup={"inline_keyboard": []})
-        except Exception:
-            pass
-        cmd_publish([data.split(":", 1)[1]])
+    data, msg = cq.get("data") or "", cq.get("message", {})
+    state = load_state()
+
+    if data.startswith("t:") or data.startswith("publish:"):
+        parts = data.split(":")
+        section, digest_id = parts[1], int(parts[2]) if len(parts) > 2 else None
+        d = state["digests"].get(section)
+        if not d or (digest_id and d.get("id") != digest_id):
+            answer("Это превью устарело: раздел уже перезапускали")
+            return
+        if data.startswith("publish:"):
+            answer("Публикую…")
+            cmd_publish([section])
+            _edit_markup(msg, digest_keyboard(load_state(), section))
+            return
+        block = d["blocks"][int(parts[3]) - 1]
+        key = item_key(block)
+        if key in state["published"]:
+            answer("Этот пункт уже опубликован")
+            return
+        if any(p["key"] == key for p in state["pool"]):
+            state["pool"] = [p for p in state["pool"] if p["key"] != key]
+            text = f"Убрано из подборки ({len(state['pool'])})"
+        else:
+            state["pool"].append({"key": key, "section": section, "block": block})
+            text = f"Добавлено в подборку ({len(state['pool'])})"
+        save_state(state)
+        answer(text)
+        _edit_markup(msg, digest_keyboard(state, section))
+
+    elif data.startswith("pr:"):                       # remove one item from the pool
+        h = data[3:]
+        state["pool"] = [p for p in state["pool"] if short_hash(p["key"]) != h]
+        save_state(state)
+        answer("Убрано")
+        _edit_text(msg, *pool_view(state))
+    elif data == "pc":
+        state["pool"] = []
+        save_state(state)
+        answer("Подборка очищена")
+        _edit_text(msg, *pool_view(state))
+    elif data == "pp":
+        answer("Публикую…")
+        if publish_pool():
+            _edit_text(msg, "✅ Подборка опубликована.", {"inline_keyboard": []})
+    else:
+        answer()
 
 
 def handle(update: dict):
