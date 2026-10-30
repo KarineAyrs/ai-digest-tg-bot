@@ -220,8 +220,9 @@ def run_section(section: str, days: int = None, scheduled: bool = False):
     save_state(state)
 
     if not result["blocks"]:
-        if not scheduled:                         # scheduled: stay silent when there is nothing new
-            tg_send(TELEGRAM_CHAT_ID, f"📭 {cfg['title']}: новых материалов нет.")
+        # one short line, so a quiet week doesn't look like a broken bot
+        tg_send(TELEGRAM_CHAT_ID, f"📭 {cfg['title']}: " + (
+            "новых материалов с прошлой сводки нет." if scheduled else "за этот период материалов нет."))
         return
     period = f"{since.astimezone(TZ):%d.%m} – {now.astimezone(TZ):%d.%m}"
     deliver(state, section, f"<b>{cfg['title']}</b> · {period}", result["blocks"])
